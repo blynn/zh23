@@ -1,0 +1,602 @@
+= Bubble =
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+<button id="fac">!</button>
+<div>
+<textarea id="cl" style="width:100%;" rows="1"></textarea>
+</div>
+<button id="go">Load</button>
+<button id="playpause">Play/Pause</button>
+speed: <input id="spd" type="range" min="0" max="6" step="1" />
+zoom: <input id="zoom" type="range" min="0" max="9" step="1" />
+<svg xmlns='http://www.w3.org/2000/svg' width='100%' height='88vh'
+style='fill:white;background-color:black;stroke-width:4;'>
+<style>
+/* @import url('https://fonts.googleapis.com/css2?family=Fuzzy+Bubbles:wght@700&display=swap'); */
+@import url('https://fonts.googleapis.com/css2?family=Nova+Mono&display=swap');
+text {
+/* font-family: 'Fuzzy Bubbles', cursive; */
+font-family: 'Nova Mono', monospace;
+font-size: 120px;
+}
+</style>
+
+<svg viewBox='-20 -100 2000 2000'>
+<g id='tooltip' opacity='0.6' />
+</svg>
+
+<svg id='svg' viewBox='-20 -1 4096 2'>
+<g id='screen'/>
+</svg>
+</svg>
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+[.hs]
+------------------------------------------------------------------------
+data Charser a = Charser { unCharser :: String -> Either String (a, String) }
+instance Functor Charser where fmap f (Charser x) = Charser $ fmap (first f) . x
+instance Applicative Charser where
+  pure a = Charser \s -> Right (a, s)
+  f <*> x = Charser \s -> do
+    (fun, t) <- unCharser f s
+    (arg, u) <- unCharser x t
+    pure (fun arg, u)
+instance Monad Charser where
+  Charser f >>= g = Charser $ (good =<<) . f
+    where good (r, t) = unCharser (g r) t
+  return = pure
+instance Alternative Charser where
+  empty = Charser \_ -> Left ""
+  (<|>) x y = Charser \s -> either (const $ unCharser y s) Right $ unCharser x s
+
+sat f = Charser \case
+  h:t | f h -> Right (h, t)
+  _ -> Left "unsat"
+
+eof = Charser \case
+  [] -> Right ((), "")
+  _ -> Left "want EOF"
+
+char :: Char -> Charser Char
+char = sat . (==)
+
+string :: String -> Charser String
+string s = mapM (sat . (==)) s
+
+oneOf :: [Char] -> Charser Char
+oneOf s = sat (`elem` s)
+
+noneOf :: [Char] -> Charser Char
+noneOf s = sat $ not . (`elem` s)
+
+digitChar :: Charser Char
+digitChar = sat $ \c -> '0' <= c && c <= '9'
+
+lowerChar :: Charser Char
+lowerChar = sat $ \c -> 'a' <= c && c <= 'z'
+
+upperChar :: Charser Char
+upperChar = sat $ \c -> 'A' <= c && c <= 'Z'
+
+letterChar :: Charser Char
+letterChar = lowerChar <|> upperChar
+
+newline :: Charser Char
+newline = char '\n'
+
+alphaNumChar :: Charser Char
+alphaNumChar = letterChar <|> digitChar
+
+space :: Charser ()
+space = many (sat isSpace) *> pure ()
+
+parse p _ = fmap fst . unCharser p
+------------------------------------------------------------------------
+
+[.hs]
+------------------------------------------------------------------------
+jsEval_ = (>> pure ()) . jsEval
+
+data BLF a = Bubble a | Arg Int | Com String | Num Integer | a :@ a deriving Show
+data Shape = Shape
+  { _w :: Int
+  , _elem :: String
+  } deriving Show
+data BL a = BL { _bl :: BLF (BL a), _sh :: a } deriving Show
+
+data Bare = Bare { unBare :: BLF Bare } deriving Show
+
+instance Show Bare where show (Bare x) = show x
+
+cl = apps where
+  apps = foldl1 enbubbleR <$> some atom
+  atom = num <|> com <|> spch '(' *> apps <* spch ')'
+  num = Bare . Num . readInteger <$> some digitChar <* space
+  com = Bare . Com <$> comStr <* space
+  comStr = (:) <$> letterChar <*> many alphaNumChar <|> some (oneOf "+-*^<>=")
+  enbubbleR a b = case unBare b of
+    _ :@ _ -> Bare $ a :@ Bare (Bubble b)
+    _ -> Bare $ a :@ b
+
+spch c = char c <* space
+
+padding = 20
+habubble = 70
+
+place (Bare cl) = case cl of
+  a :@ b -> do
+    abl <- place a
+    bbl <- place b
+    hcat abl bbl
+  Arg i -> single (Arg i) [['a'..]!!i]
+  Com s -> single (Com s) s
+  Num n -> single (Num n) $ show n
+  Bubble a -> do
+    a@(BL _ (Shape aw ak)) <- place a
+    let w = aw + 2*padding
+    k <- jsEval $ [r|
+const wHalf = |]++show (div w 2)++[r|;
+const g = svgnew("g");
+const c = svgnew("circle");
+c.setAttribute("stroke", "white");
+c.setAttribute("stroke-width", "8");
+c.setAttribute("fill", "none");
+c.setAttribute("cx", wHalf);
+c.setAttribute("r", wHalf);
+g.appendChild(c);
+const a = memo[|] ++ ak ++ [r|];
+a.setAttribute("transform", "translate(|] ++ show padding ++ [r|, 0)");
+g.appendChild(a);
+memo_put(g);
+|]
+    pure $ BL (Bubble a) $ Shape w k
+
+hcat a@(BL _ (Shape aw ak)) b@(BL _ (Shape bw bk)) = do
+  k <- jsEval $ [r|
+const g = svgnew("g");
+g.appendChild(memo[|] ++ ak ++ [r|]);
+const b = memo[|] ++ bk ++ [r|];
+g.appendChild(b);
+b.setAttribute("transform", "translate(|] ++ show (aw + padding) ++ [r|,0)");
+memo_put(g);
+|]
+  pure $ BL (a :@ b) $ Shape (aw + bw + padding) k
+
+single b s = BL b <$> stringBubble s
+
+stringBubble s = Shape (textLen + 74) <$> jsEval ([r|
+const g=svgnew("g");
+g.innerHTML = `<path fill="none" stroke-width="8" stroke="|] ++ colour ++ [r|" d="
+M 70 -70
+A 70 70 0 0 0 70 70
+L |] ++ show (textLen + 4) ++ [r| 70
+A 70 70 0 0 0 |] ++ show (textLen + 4) ++ [r| -70
+Z
+">`
+const e=svgnew("text");
+e.setAttribute("x", "35");
+e.setAttribute("y", "40");
+e.setAttribute("fill", "|] ++ colour ++ [r|");
+e.textContent = "|] ++ s ++ [r|";
+g.appendChild(e);
+
+memo_put(g);
+|])
+  where
+  textLen = length s * 66
+  colour = maybe "white" id $ lookup s
+    [ ("B", "burlywood")
+    , ("M", "magenta")
+    , ("T", "turquoise")
+    , ("K", "khaki")
+    , ("I", "ivory")
+    , ("S", "silver")
+    , ("C", "chartreuse")
+    , ("R", "red")
+    , ("Y", "yellow")
+    , ("Q", "aquamarine")
+
+    , ("a", "aqua")
+    , ("b", "bisque")
+    , ("c", "coral")
+    , ("d", "darksalmon")
+    ]
+
+demo = do
+  cancelAnim
+  s <- getContents
+  jsEval $ "console.log(`" ++ s ++ "`);"
+  case parse (space *> cl <* eof) "" s of
+    Left e -> jsEval_ $ "console.log(`" ++ e ++ "`);"
+    Right x -> render0 x
+
+render0 x = do
+  jsEval "memo_init();"
+  b@(BL _ (Shape _ k)) <- place x
+  jsEval $ "scr.appendChild(memo[" ++ k ++ "]);"
+  global >>= \g -> setGlobal g{_anim = (Nothing, const $ render x)}
+
+render x = do
+  jsEval "memo_init();"
+  b@(BL _ (Shape _ k)) <- place x
+  jsEval $ "scr.appendChild(memo[" ++ k ++ "]);"
+  global >>= \g -> setGlobal g{_pause = const $ jsEval_ "requestAnimationFrame(animate);"}
+  reduce $ spinal [] b
+
+spinal acc t = case t of
+  (BL (x :@ _) _) -> spinal (t:acc) x
+  _ -> t:acc
+
+expr = foldl1 (\x y -> Bare $ x :@ y) <$> some atom where
+  atom = arg <|> com <|> spch '(' *> expr <* spch ')'
+  com = Bare . Com . (:[]) <$> alphaNumChar <* space
+  arg = Bare . Arg . (\c -> ord c - ord 'a') <$> lowerChar
+
+bad = Charser . const . Left
+
+defn = do
+  s <- (:) <$> upperChar <*> many digitChar
+  args <- some letterChar
+  let n = length args
+  unless (args == take n ['a'..'z']) $ bad "use abc... for args"
+  char '='
+  space
+  x <- expr
+  pure (s, (n, x))
+
+mustDefn = either (error "bad defn") id . parse defn ""
+
+combs = mustDefn <$>
+  [ "Sabc=ac(bc)"
+  , "Babc=a(bc)"
+  , "Cabc=acb"
+  , "Rabc=bca"
+  , "Kab=a"
+  , "Tab=ba"
+  , "Ma=aa"
+  , "Ia=a"
+  , "Lab=a(bb)"
+  , "Wab=abb"
+  , "Vabc=cab"
+  , "Ya=a(Ya)"
+  , "Qabc=c(ba)"
+
+  , "B1abcd=a(bcd)"
+  , "Xa=aS(BKK)"
+  ]
+
+setAnim x = global >>= \g -> setGlobal g{_anim = x}
+
+startAnim f = do
+  setAnim (Nothing, f)
+  jsEval_ "requestAnimationFrame(animate);"
+
+cancelAnim = setAnim (Nothing, const $ pure ())
+
+anim t = do
+  (mt0, f) <- _anim <$> global
+  t0 <- case mt0 of
+    Nothing -> setAnim (Just t, f) *> pure t
+    Just t0 -> pure t0
+  f $ t - t0
+
+slideX sh x0 x1 part = jsEval_ $ "memo[" ++ _elem sh ++ [r|].setAttribute("transform", "translate(|] ++ show (part (x1 - x0) + x0) ++ [r|, 0)");|]
+
+slideScr x0 x1 part = jsEval_ $ [r|scr.setAttribute("transform", "translate(|] ++ show (part (x1 - x0) + x0) ++ [r|, 0)");|]
+
+growBubble sh sz part = do
+  let n = show $ div (part (sz - _w sh) + _w sh) 2
+  jsEval_ $ [r|
+const e = memo[|] ++ _elem sh ++ [r|].firstChild;
+e.setAttribute("r", "|] ++ n ++ [r|");
+e.setAttribute("cx", "|] ++ n ++ [r|");
+|]
+
+summon sh part = jsEval_ $ "memo[" ++ _elem sh ++ [r|].setAttribute("opacity", "0.|] ++ tail (show $ 100 + part 99) ++ [r|");|]
+
+vanish sh part = jsEval_ $ "memo[" ++ _elem sh ++ [r|].setAttribute("opacity", "0.|] ++ tail (show $ 199 - part 99) ++ [r|");|]
+
+popBubble sh part = jsEval_ $ "memo[" ++ _elem sh ++ [r|].firstChild.setAttribute("stroke-dasharray", "|] ++ show (20 - part 20) ++ " " ++ show (part 20) ++ [r|");|]
+
+shake sh part = do
+  let (x, y) = divMod (part 100000 `mod` 441) 21
+  jsEval_ $ "memo[" ++ _elem sh ++ [r|].setAttribute("transform", "translate|] ++ show (x - 10, y - 10) ++ [r|");|]
+
+movie action epilogue = startAnim $ frame 1 action epilogue
+
+movieFast n action epilogue = startAnim $ frame n action epilogue
+
+data Global = Global
+  { _dur :: Int
+  , _anim :: (Maybe Int, Int -> IO ())
+  , _pause :: Int -> IO ()
+  }
+
+playpause = do
+  g <- global
+  setGlobal g
+    { _anim = (Nothing, _pause g)
+    , _pause = snd $ _anim g
+    }
+  snd (_anim g) 0
+
+getDur :: IO Int
+getDur = _dur <$> global
+
+setDur :: Int -> IO ()
+setDur n = global >>= \g -> setGlobal g{_dur = n}
+
+frame speedup movers epilogue ms = do
+  dur <- getDur
+  let part n = n * speedup * ms `div` dur
+  if speedup * ms >= dur then (mapM_ ($ id) movers *> epilogue) else do
+    mapM_ ($ part) movers
+    jsEval_ "requestAnimationFrame(animate);"
+
+setAnimSpeed = do
+  n <- readInteger <$> getContents
+  setDur $ 2^(12 - n)
+
+strip (BL t _) = case t of
+  Bubble a -> Bare $ Bubble $ strip a
+  x :@ y -> Bare $ strip x :@ strip y
+  Com c -> Bare $ Com c
+  Num n -> Bare $ Num n
+
+argOf (BL (x :@ y) _) = y
+
+bareReduce n x args = foldl ((Bare .) . (:@)) (go 0 x) rest where
+  (used, rest) = splitAt n args
+  go prec (Bare b) = case b of
+    Arg i -> used!!i
+    Com _ -> Bare b
+    x :@ y -> case prec of
+      0 -> Bare $ go 0 x :@ go 1 y
+      1 -> case go 2 x of
+        Bare (Bubble x') -> Bare $ Bubble $ Bare $ x' :@ go 1 y
+        x' -> Bare $ Bubble $ Bare $ x' :@ go 1 y
+      2 -> Bare $ case go 2 x of
+        Bare (Bubble x') -> x' :@ go 1 y
+        x' -> x' :@ go 1 y
+
+unspinalBare f spine = foldl ((Bare .) . (:@)) f $ strip . argOf <$> spine
+
+intops =
+  [ ("+", (+))
+  , ("-", (-))
+  , ("*", (*))
+  , ("^", (^))
+  , ("mod", mod)
+  , ("div", div)
+  ]
+
+intTests =
+  [ ("<", (<))
+  , (">", (>))
+  , ("<=", (<=))
+  , (">=", (>=))
+  , ("==", (==))
+  , ("/=", (/=))
+  ]
+
+clearTootip = jsEval_ "tooltip.innerHTML = '';"
+
+rebubble = go 0 where
+  go prec (Bare b) = case b of
+    x :@ y -> case prec of
+      0 -> Bare $ go 0 x :@ go 1 y
+      1 -> Bare $ Bubble $ Bare $ go 0 x :@ go 1 y
+    _ -> Bare b
+
+reduce (BL h sh:spine) = case h of
+  Bubble x -> do
+    let next = foldl ((Bare .) . (:@)) (strip x) $ strip . argOf <$> spine
+    movieFast 4 [popBubble sh, slideScr 0 (-2*padding), slideX sh 0 padding] $ render next
+  Num n | h:t <- spine -> do
+    let next = foldl ((Bare .) . (:@)) (strip $ argOf h) $ Bare (Num n) : (strip . argOf <$> t)
+    let hSh = _sh $ argOf h
+    movie [slideX sh 0 $ _w hSh + padding, slideX hSh (_w sh + padding) 0] $ render next
+  Com s
+    | Just op <- lookup s intops, sp1:sp2:rest <- spine, BL (Num a) aSh <- argOf sp1, BL (Num b) bSh <- argOf sp2 -> do
+      let result = Bare $ Num $ op a b
+      BL _ rSh <- place result
+      jsEval $ [r|
+const x = memo[|] ++ _elem rSh ++ [r|];
+x.setAttribute("opacity", "0");
+scr.appendChild(x);
+|]
+      let f = if null rest then id else (slideX (_sh (last rest)) 0 (_w rSh - _w (_sh sp2)):)
+      movie (f $ summon rSh : (vanish <$> [aSh, bSh, sh])) $ render $ unspinalBare result rest
+-- TODO: Compiler bug? If following line deleted, compiles and runs slowly.
+  Com s
+    | Just (n, x) <- lookup s combs, n <= length spine -> do
+      lhs <- place $ foldl ((Bare .) . (:@)) (Bare $ Com s) $ (Bare . Com . (:[])) <$> take n ['a'..]
+      rhs <- place $ rebubble x
+      jsEval $ [r|
+tooltip.innerHTML = '<text x="|] ++ show (_w (_sh lhs) + 40) ++ [r|" y="40" fill="white">&LongRightArrow;</text>';
+const x = memo[|] ++ _elem (_sh lhs) ++ [r|];
+tooltip.appendChild(x);
+const y = memo[|] ++ _elem (_sh rhs) ++ [r|];
+y.setAttribute("transform", "translate(|] ++ show (140 + _w (_sh lhs)) ++ [r|,0)");
+tooltip.appendChild(y);
+|]
+      (_, (movers, edge, present)) <- rollCall 0 ([shake sh], _w sh + padding, []) x
+      let next = bareReduce n x $ strip . argOf <$> spine
+      -- jsEval $ "memo[" ++ _elem sh ++ "].remove();"
+
+      let goners = concat $ zipWith (\x (BL (_ :@ (BL _ sh)) _) -> if x `elem` present then [] else [vanish sh]) (take n [0..]) spine
+
+      flip mapM_ (take n spine) \(BL _ sh) -> do
+        jsEval $ "memo[" ++ _elem sh ++ "].remove();"
+        jsEval $ "scr.appendChild(memo[" ++ _elem sh++ "]);"
+      movers <- pure $ if n == length spine then movers else slideX (_sh $ last spine) 0 (edge - _w (_sh $ spine!!(n-1))):movers
+      movie (goners ++ movers) $ do
+        jsEval $ "memo[" ++ _elem sh ++ "].remove();"
+        movieFast 2 [slideScr 0 -(_w sh + padding)] $ clearTootip >> render next
+  Com s
+    | Just op <- lookup s intTests, sp1:sp2:rest <- spine, BL (Num a) aSh <- argOf sp1, BL (Num b) bSh <- argOf sp2 -> do
+      let result = Bare $ if op a b then Com "K" else Bare (Com "K") :@ Bare (Com "I")
+      BL _ rSh <- place result
+      jsEval $ "scr.appendChild(memo[" ++ _elem rSh++ "]);"
+      let f = if null rest then id else (slideX (_sh (last rest)) 0 (_w rSh - _w (_sh sp2)):)
+      movie (f $ summon rSh : (vanish <$> [aSh, bSh, sh])) $ render $ unspinalBare result rest
+  _ -> do
+    jsEval_ $ "console.log('normal form');"
+  where
+  rollCall prec (movers, edge, present) (Bare b) = case b of
+    Arg i -> do
+      let
+        BL (_ :@ BL a aSh) par = spine!!i
+        x0 = _w par - _w aSh
+      (aSh, present) <- if not (elem i present) then pure (aSh, i:present) else do
+        k <- jsEval $ [r|
+  const g=svgnew("g");
+  g.innerHTML = memo[|] ++ _elem aSh ++ [r|].innerHTML;
+  g.setAttribute("transform", memo[|] ++ _elem aSh ++ [r|].getAttribute("transform"));
+  scr.appendChild(g);
+  memo_put(g);
+  |]
+        pure (Shape (_w aSh) k, present)
+      (pad, f, sh1) <- newBub a aSh x0
+      pure ((sh1, edge), (slideX sh1 x0 edge:f movers, edge + _w aSh + pad, present))
+
+    Com s -> do
+      sh <- stringBubble s
+      jsEval $ [r|
+const x = memo[|] ++ _elem sh ++ [r|];
+x.setAttribute("transform", "translate(|] ++ show edge ++ [r|,0)");
+x.setAttribute("opacity", "0");
+scr.appendChild(x);
+|]
+      (pad, f, sh1) <- newBub (Com s) sh edge
+      pure ((sh1, edge), (summon sh:f movers, edge + _w sh + pad, present))
+    -- TODO: Draw primitives from scratch.
+    x :@ y -> case prec of
+      0 -> do
+        (_, (action, edge, present)) <- rollCall 0 (movers, edge, present) x
+        rollCall 1 (action, edge + padding, present) y
+      1 -> do
+        ((sh, x1), (movers, edge, present)) <- rollCall 2 (movers, edge, present) x
+        (_, (movers, edge, present)) <- rollCall 1 (movers, edge + padding, present) y
+        pure (undefined, (growBubble sh (edge + padding - x1):movers, edge + padding, present))
+      2 -> do
+        (shx, (action, edge, present)) <- rollCall 2 (movers, edge, present) x
+        first (const shx) <$> rollCall 1 (action, edge + padding, present) y
+    where
+      newBub a sh x0 = if prec == 2
+        then case a of
+          Bubble _ -> pure (-padding, id, sh)
+          _ -> do
+            k <- jsEval $ [r|
+const g=svgnew("g");
+const c=svgnew("circle");
+c.setAttribute("stroke-width", "8");
+c.setAttribute("cx", "70");
+c.setAttribute("r", "70");
+c.setAttribute("fill", "none");
+c.setAttribute("stroke", "white");
+g.appendChild(c);
+g.setAttribute("transform", "translate(|] ++ show x0 ++ [r|, 0)");
+scr.appendChild(g);
+memo_put(g);
+|]
+            pure (padding, (slideX sh x0 (edge + padding):), Shape (2*habubble) k)
+        else pure (0, id, sh)
+  grow (sh, x1) (movers, edge, present) = do
+    pure (undefined, (growBubble sh (edge + padding - x1):movers, edge + padding, present))
+------------------------------------------------------------------------
+
+[.hs]
+------------------------------------------------------------------------
+setGlobal Global
+  { _dur = undefined
+  , _anim = (Nothing, const $ pure ())
+  , _pause = const $ pure ()
+  }
+------------------------------------------------------------------------
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+<script>
+"use strict";
+const scr = document.getElementById('screen');
+let memo, memo_idx;
+function memo_put(elem) { memo.push(elem); return memo_idx++; }
+function memo_init() {
+memo_idx = 0;
+memo = []
+memo_put(scr);
+scr.innerHTML = "";
+scr.setAttribute("transform", "");
+}
+function svgnew(s) { return document.createElementNS('http://www.w3.org/2000/svg', s); }
+const env = {};
+function run(f, args, s) {
+  env.args = args.map(teen);
+  env.buf = [];
+  env.out = [];
+  env.inp = teen(s);
+  env.cursor = 0;
+  env.eval_in = [], env.eval_out = [];
+  env.instance.exports[f]();
+  return { buf : env.buf, out : env.out };
+}
+function teen(s) { return (new TextEncoder()).encode(s); }
+function tede(s) { return (new TextDecoder()).decode(s); }
+function tedea(a) { return (new TextDecoder()).decode(Uint8Array.from(a)); }
+async function load() {
+  try {
+    env.instance = (await WebAssembly.instantiateStreaming(fetch('doh.wasm'), {env:
+      { putchar: c  => env.out.push(c)
+      , eof    : () => env.cursor == env.inp.length
+      , getchar: () => env.inp[env.cursor++]
+      , nextout: () => { env.buf.push(env.out); env.out = []; }
+      , argc   : () => env.args.length
+      , argvlen: i => env.args[i].length
+      , argvat : (i, j) => env.args[i][j]
+
+      , eval_put : c  => env.eval_in.push(c)
+      , eval_run : () => {
+          env.eval_out = teen(eval(tedea(env.eval_in)));
+          env.eval_in = [];
+        }
+      , eval_size: () => env.eval_out.length
+      , eval_at:   i  => env.eval_out[i]
+      }})).instance;
+    run("chat_new", ["Main"], "");
+    const frags = document.getElementsByClassName("hs");
+    for (const it of frags) {
+      const r = run("chat", ["Main"], it.innerText + "\n");
+  const status = tedea(r.buf[0]);
+  console.log("status", status);
+  if (status == "error") {
+  console.log(tedea(r.out));
+  console.log(it.innerText);
+}
+    }
+    document.getElementById("fac").addEventListener("click", (ev) => {
+document.getElementById("cl").value = "Y(B(R 1)(B(S((Q<) 1))(B(S (Q*))(R(R 1 (Q-)) B))))4";
+});
+    document.getElementById("go").addEventListener("click", (ev) => {
+run("eval_expr", ["Main", "demo"], document.getElementById("cl").value);
+});
+    document.getElementById("playpause").addEventListener("click", (ev) => {
+run("eval_expr", ["Main", "playpause"], "");
+});
+    document.getElementById("spd").addEventListener("input", (ev) => {
+run("eval_expr", ["Main", "setAnimSpeed"], ev.target.value.toString());
+});
+    run("eval_expr", ["Main", "setAnimSpeed"], "4");
+    document.getElementById("zoom").addEventListener("input", (ev) => {
+document.getElementById("svg").setAttribute("viewBox", "-20 -1 " + ((10 - ev.target.value) * 1024) + " 2");
+});
+  } catch(err) {
+    console.log(err);
+  }
+}
+load();
+
+function animate(t) {
+  run("eval_expr", ["Main", "anim " + Math.round(t)], "");
+}
+</script>
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++

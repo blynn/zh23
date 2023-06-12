@@ -1,0 +1,1966 @@
+= Slides =
+
+== Trees ==
+
+The `HTML` data type actually holds all sorts of trees, not just HTML.
+
+I would have used it for combinator terms but I re-used existing code which
+defined `CL`.
+
+[.hs]
+------------------------------------------------------------------------
+data HTML = Txt String | Nd String [HTML] deriving Show
+
+data CL = Com String | CL :@ CL
+instance Show CL where
+  showsPrec p = \case
+    t :@ u -> showParen (p > 0) $ showsPrec 0 t . showsPrec 1 u
+    -- Com s -> (if p > 0 then (' ':) else id) . (s++)
+    Com s -> (s++)
+------------------------------------------------------------------------
+
+== Bracket Abstraction ==
+
+[.hs]
+------------------------------------------------------------------------
+polishShow = \case
+  t :@ u -> ('o':) . polishShow t . polishShow u
+  Com s -> (s++)
+
+index x xs = lookup x $ zip xs $ iterate (Nd "S" . (:[])) $ Nd "Z" []
+
+deBruijn = deBruijnWith []
+deBruijnWith binds = \case
+  Txt x -> maybe (Txt x) id $ index x binds
+  Nd "\\" [Txt x, t] -> Nd "L" [deBruijnWith (x:binds) t]
+  Nd "@" [t, u] -> Nd "@" [deBruijnWith binds t, deBruijnWith binds u]
+  Nd "U" _ -> deBruijnWith binds $ Txt "U"
+
+convertWith (#) = \case
+  Nd "Z" _ -> (True:[], Com "I")
+  Nd "S" [e] -> (False:g, d) where (g, d) = rec e
+  Nd "L" [e] -> case rec e of
+    ([], d) -> ([], Com "K" :@ d)
+    (False:g, d) -> (g, ([], Com "K") # (g, d))
+    (True:g, d) -> (g, d)
+  Nd "@" [e1, e2] -> (zipWithDefault False (||) g1 g2, t1 # t2) where
+    t1@(g1, _) = rec e1
+    t2@(g2, _) = rec e2
+  Txt s -> ([], Com s)
+  where rec = convertWith (#)
+
+kis = snd . convertWith (#) where
+  ([], d1) # ([], d2) = d1 :@ d2
+  ([], d1) # (True:[], Com "I") = d1
+  ([], d1) # (True:g2, d2) = ([], Com "B" :@ d1) # (g2, d2)
+  ([], d1) # (False:g2, d2) = ([], d1) # (g2, d2)
+  (True:[], Com "I") # ([], d2) = Com "T" :@ d2
+  (True:[], Com "I") # (False:g2, d2) = ([], Com "T") # (g2, d2)
+  (True:g1, d1) # ([], d2) = ([], Com "R" :@ d2) # (g1, d1)
+  (True:g1, d1) # (True:g2, d2) = (g1, ([], Com "S") # (g1, d1)) # (g2, d2)
+  (True:g1, d1) # (False:g2, d2) = (g1, ([], Com "C") # (g1, d1)) # (g2, d2)
+  (False:g1, d1) # ([], d2) = (g1, d1) # ([], d2)
+  (False:g1, d1) # (True:[], Com "I") = d1
+  (False:g1, d1) # (True:g2, d2) = (g1, ([], Com "B") # (g1, d1)) # (g2, d2)
+  (False:g1, d1) # (False:g2, d2) = (g1, d1) # (g2, d2)
+
+zipWithDefault d f     []     ys = f d <$> ys
+zipWithDefault d f     xs     [] = flip f d <$> xs
+zipWithDefault d f (x:xt) (y:yt) = f x y : zipWithDefault d f xt yt
+
+skOnly = \case
+  a :@ b -> skOnly a :@ skOnly b
+  Com "I" -> s :@ k :@ k
+  Com "B" -> s :@ (k :@ s) :@ k
+  Com "C" -> s :@ (s :@ (k :@ (s :@ (k :@ s) :@ k)) :@ s) :@ (k :@ k)
+  Com "R" -> s :@ (k :@ (s :@ (k :@ (s :@ s)) :@ k)) :@ k
+  t -> t
+  where
+  s = Com "S"
+  k = Com "K"
+
+skTo s = \case
+  a :@ b -> skTo s a :@ skTo s b
+  Com "K" -> x :@ x
+  Com "S" -> x :@ (x :@ x)
+  where x = Com s
+
+skAbstract = toCom . skAbstract' where
+  skAbstract' = \case
+    Nd "\\" [Txt v, t] -> go v $ skAbstract' t
+    Nd "@" as -> Nd "@" $ skAbstract' <$> as
+    t -> t
+  go v t = case t of
+    Txt w | v == w -> Nd "I" []
+          | otherwise -> Nd "@" [Nd "K" [], t]
+    Nd "@" [a, b] -> Nd "@" [Nd "S" [], Nd "@" [go v a, go v b]]
+    _ -> t
+  toCom = \case
+    Nd "@" [a, b] -> toCom a :@ toCom b
+    Nd "I" [] -> Com "S" :@ Com "K" :@ Com "K"
+    Nd com [] -> Com com
+------------------------------------------------------------------------
+
+K-optimized, don't think I'll use it:
+
+------------------------------------------------------------------------
+lacks v = \case
+  Nd "@" [a, b] -> lacks v a && lacks v b
+  Txt w -> v /= w
+  _ -> False
+
+rosenK = \case
+  Nd "\\" [Txt v, x] -> elimV (rosenK x) where
+    elimV t
+      | lacks v t = Nd "K" [] # t
+      | otherwise = case t of
+        Txt _ -> Nd "S" [] # Nd "K" [] # Nd "K" []
+        Nd "@" [a, b] -> Nd "S" [] # elimV a # elimV b
+        _ -> t
+  Nd "@" [a, b] -> rosenK a # rosenK b
+  t -> t
+  where f # x = Nd "@" [f, x]
+------------------------------------------------------------------------
+
+== Parser Combinators ==
+
+[.hs]
+------------------------------------------------------------------------
+data Charser a = Charser { unCharser :: String -> Either String (a, String) }
+instance Functor Charser where fmap f (Charser x) = Charser $ fmap (first f) . x
+instance Applicative Charser where
+  pure a = Charser \s -> Right (a, s)
+  f <*> x = Charser \s -> do
+    (fun, t) <- unCharser f s
+    (arg, u) <- unCharser x t
+    pure (fun arg, u)
+instance Monad Charser where
+  Charser f >>= g = Charser $ (good =<<) . f
+    where good (r, t) = unCharser (g r) t
+  return = pure
+instance Alternative Charser where
+  empty = Charser \_ -> Left ""
+  (<|>) x y = Charser \s -> either (const $ unCharser y s) Right $ unCharser x s
+
+sat f = Charser \case
+  h:t | f h -> Right (h, t)
+  _ -> Left "unsat"
+
+char c = sat (c ==)
+oneOf s = sat (`elem` s)
+
+eof = Charser \case
+  [] -> Right ((), "")
+  _ -> Left "want EOF"
+
+bad = Charser . const . Left
+
+lookahead (Charser x) = Charser \inp -> do
+  (a, _) <- x inp
+  pure (a, inp)
+
+string s = mapM char s
+
+lowerChar = sat $ \c -> 'a' <= c && c <= 'z'
+upperChar = sat $ \c -> 'A' <= c && c <= 'Z'
+letterChar = lowerChar <|> upperChar
+
+space = many (sat isSpace) *> pure ()
+spaceLn = many $ many (char ' ') <* char '\n'
+
+parse p = fmap fst . unCharser p
+------------------------------------------------------------------------
+
+== Logic formula parsers ==
+
+[.hs]
+------------------------------------------------------------------------
+boolExpr = iff where
+  iff = foldr1 (\a b -> Nd "<=>" [a, b]) <$> impl `sepBy1` op "<=>"
+  impl = foldr1 (\a b -> Nd "=>" [a, b]) <$> disj `sepBy1` op "=>"
+  disj = foldl1 (\a b -> Nd "+" [a, b]) <$> conj `sepBy1` op "+"
+  conj = foldl1 (\a b -> Nd "*" [a, b]) <$> lit `sepBy1` op "*"
+  lit = op "~" *> (Nd "~" . (:[]) <$> atom) <|> atom
+  atom = op "(" *> boolExpr <* op ")" <|> Txt <$> var
+  var = some letterChar <* space
+  op s = string s <* space
+
+hol = quant <|> iff where
+  quant = do
+    q <- (string "forall" <|> string "exists") <* space
+    v <- var
+    op "."
+    t <- hol
+    pure $ Nd q [Txt v , t]
+  iff = foldr1 (\a b -> Nd "<=>" [a, b]) <$> impl `sepBy1` op "<=>"
+  impl = foldr1 (\a b -> Nd "=>" [a, b]) <$> disj `sepBy1` op "=>"
+  disj = foldl1 (\a b -> Nd "+" [a, b]) <$> conj `sepBy1` (op "+" <|> op "|" <|> op "||")
+  conj = foldl1 (\a b -> Nd "*" [a, b]) <$> lit `sepBy1` (op "*" <|> op "&" <|> op "&&")
+  lit = (op "~" <|> op "-") *> (Nd "~" . (:[]) <$> atom) <|> app
+  app = foldl1 (\a b -> Nd "@" [a, b]) <$> some atom
+  atom = op "(" *> hol <* op ")" <|> Txt <$> var
+  var = some letterChar <* space
+  op s = string s <* space
+
+lambda = flip (foldr lam) <$> (ch '\\' *> many var <* (ch '.' *> pure() <|> string "->" *> pure ()) <* space) <*> lambda
+  <|> foldl1 app <$> some atom
+  where
+  atom = ch '(' *> lambda <* ch ')' <|> var
+  ch c = char c <* space
+  var = Txt <$> some letterChar <* space
+  app x y = Nd "@" [x, y]
+  lam s t = Nd "\\" [s, t]
+------------------------------------------------------------------------
+
+== Schönfinkel's Showstoppers ==
+
+[.hs]
+------------------------------------------------------------------------
+texShow prec = \case
+  Nd "forall" [Txt v, t] -> showParen (prec > 0) $ tex "forall" . (v++) . ('.':) . texShow 0 t
+  Nd "exists" [Txt v, t] -> showParen (prec > 0) $ tex "exists". (v++) . ('.':) . texShow 0 t
+  Nd "<=>" [a, b] -> showParen (prec > 1) $ texShow 2 a . tex "iff" . texShow 2 b
+  Nd "=>" [a, b] -> showParen (prec > 2) $ texShow 3 a . tex "implies" . texShow 2 b
+  Nd "+" [a, b] -> showParen (prec > 3) $ texShow 3 a . tex "vee" . texShow 3 b
+  Nd "*" [a, b] -> showParen (prec > 4) $ texShow 4 a . tex "wedge" . texShow 4 b
+  Nd "@" [a, b] -> showParen (prec > 5) $ texShow 5 a . tex "" . texShow 6 b
+  Nd "~" [a] -> showParen (prec > 6) $ tex "neg" . texShow 6 a
+  Txt s -> (s++)
+  where tex s = ('\\':) . (s++) . (' ':)
+
+nandShow x = foldr1 (.) $ intersperse ("; "++) $ f:defs where
+  (f, defs) = runState (go x) []
+  addDef f = get >>= put . (f:)
+  go = \case
+    Nd "NAND" [a, b] -> showParen True <$> ((.) <$> go a <*> go b)
+    Nd "=" [Txt v, a] -> do
+      addDef . ((v++) . ('=':) .) =<< go a
+      pure (v++)
+    Nd "UNAND" [Txt v, a, b] -> do
+      goA <- go a
+      goB <- go b
+      pure $ showParen True $ (v++) . ('.':) . goA . (" "++) . goB
+    Nd "@" [a, b] -> do
+      goA <- go a
+      goB <- go b
+      pure $ showParen True $ goA . (" "++) . goB
+    Txt s -> pure (s++)
+
+nandify = \case
+  Nd "<=>" [a, b] -> nandify $ Nd "*" [Nd "=>" [a, b], Nd "=>" [b, a]]
+  Nd "=>" [a, b] -> nandify $ Nd "+" [anti a, b]
+  Nd "+" [a, b] -> nand (nandify $ anti a) (nandify $ anti b)
+  Nd "*" [a, b] -> nandify $ anti $ nand (nandify a) (nandify b)
+  Nd "~" [x] -> case x of
+    Nd "*" [a, b] -> nand (nandify a) (nandify b)
+    a -> nand na na where na = nandify a
+  t -> t
+  where
+  nand a b = Nd "NAND" [a, b]
+
+anti = \case
+  Nd "~" [a] -> a
+  a -> Nd "~" [a]
+
+shareNandify x = evalState (go x) 0 where
+  share a = case a of
+    Txt _ -> pure (a, a)
+    _ -> do
+      k <- get
+      put $ k + 1
+      let v = Txt $ show k
+      ga <- go a
+      pure (Nd "=" [v, ga], v)
+  go = \case
+    Nd "=" [v, a] -> Nd "=" . (v:) . (:[]) <$> go a
+    Nd "<=>" [a, b] -> do
+      (defA, refA) <- share a
+      (defB, refB) <- share b
+      go $ Nd "*" [Nd "=>" [defA, defB], Nd "=>" [refB, refA]]
+    Nd "=>" [a, b] -> go $ Nd "+" [anti a, b]
+    Nd "+" [a, b] -> nand <$> go (anti a) <*> go (anti b)
+    Nd "*" [a, b] -> go . anti =<< nand <$> go a <*> go b
+    Nd "~" [x] -> case x of
+      Nd "*" [a, b] -> nand <$> go a <*> go b
+      a -> do
+        (def, ref) <- share =<< go a
+        pure $ nand def ref
+    t -> pure t
+  nand a b = Nd "NAND" [a, b]
+
+elimExists = \case
+  Nd "exists" [Txt v, t] -> anti $ Nd "forall" [Txt v, anti t]
+  Nd f xs -> Nd f $ elimExists <$> xs
+  t -> t
+
+unandify = go . elimExists where
+  go = \case
+    Nd "forall" [Txt v, t] -> case t of
+      Nd "+" [a, b] -> unand v (go $ anti a) (go $ anti b)
+      Nd "~" [Nd "*" [a, b]] -> unand v (go a) (go b)
+      Nd "~" [a] -> unand v ua ua where ua = go a
+      _ -> unand v n n where n = go $ anti t
+    Nd "<=>" [a, b] -> go $ Nd "*" [Nd "=>" [a, b], Nd "=>" [b, a]]
+    Nd "=>" [a, b] -> go $ Nd "+" [anti a, b]
+    Nd "+" [a, b] -> unand "_" (go $ anti a) (go $ anti b)
+    Nd "*" [a, b] -> go $ anti $ unand "_" (go a) (go b)
+    Nd "~" [x] -> case x of
+      Nd "*" [a, b] -> unand "_" (go a) (go b)
+      a -> unand "_" ua ua where ua = go a
+    t -> t
+  unand v a b = Nd "UNAND" [Txt v, a, b]
+
+shareUnandify = (`evalState` 0) . go . elimExists where
+  share a = case a of
+    Txt _ -> pure (a, a)
+    _ -> do
+      k <- get
+      put $ k + 1
+      let v = Txt $ show k
+      ga <- go a
+      pure (Nd "=" [v, ga], v)
+  go = \case
+    Nd "forall" [Txt v, t] -> case t of
+      Nd "+" [a, b] -> unand v <$> go (anti a) <*> go (anti b)
+      Nd "~" [Nd "*" [a, b]] -> unand v <$> go a <*> go b
+      Nd "~" [a] -> fmap (uncurry $ unand v) . share =<< go a
+      _ -> fmap (uncurry $ unand v) . share =<< go (anti t)
+    Nd "<=>" [a, b] -> do
+      (defA, refA) <- share a
+      (defB, refB) <- share b
+      go $ Nd "*" [Nd "=>" [defA, defB], Nd "=>" [refB, refA]]
+    Nd "=>" [a, b] -> go $ Nd "+" [anti a, b]
+    Nd "+" [a, b] -> unand "_" <$> go (anti a) <*> go (anti b)
+    Nd "*" [a, b] -> go . anti =<< unand "_" <$> go a <*> go b
+    Nd "~" [x] -> case x of
+      Nd "*" [a, b] -> unand "_" <$> go a <*> go b
+      a -> fmap (uncurry $ unand "_") . share =<< go a
+    t -> pure t
+  unand v a b = Nd "UNAND" [Txt v, a, b]
+
+unandLamb = \case
+  Nd "UNAND" [Txt v, a, b] -> Nd "U" [] # lamb v a # lamb v b
+  Nd "@" as -> Nd "@" $ unandLamb <$> as
+  t -> t
+  where
+  f # x = Nd "@" [f, x]
+  lamb v a = Nd "\\" [Txt v, unandLamb a]
+
+lambShow prec = \case
+  Nd "\\" [Txt v, a] -> showParen (prec > 0) $ ("\\"++) . (v++) . (" -> "++) . lambShow 0 a
+  Nd "@" [a, b] -> showParen (prec > 1) $ lambShow 1 a . (' ' :) . lambShow 2 b
+  Nd s [] -> (s++)
+  Txt s -> (s++)
+
+combShow prec = \case
+  Nd "@" [a, b] -> showParen (prec > 0) $ combShow 0 a . (' ' :) . combShow 1 b
+  Nd s [] -> (s++)
+  Txt s -> (s++)
+------------------------------------------------------------------------
+
+== AsciiQuack ==
+
+A worst-in-class AsciiDoctor.
+
+[.hs]
+------------------------------------------------------------------------
+tops = Nd "div" <$> top [] `sepBy` spaceLn
+
+top attrs = (attr >>= top . (:attrs)) <|> addAttrs attrs <$> block
+
+addAttrs as t = case as of
+  [] -> t
+  _ -> Nd "attr" $ t:(Txt <$> as)
+
+attr = char '[' *> some (sat (/= ']')) <* char ']' <* spaceLn
+
+block = heading <|> image <|> eqnblock <|> litblock <|> list <|> passthrough <|> paragraph
+
+image = do
+  file <- string "image::" *> some (sat (/= '[')) <* string "[]" <* spaceLn
+  pure $ Nd "img" [Txt file]
+
+eqnblock = do
+  s <- (++) <$> string "\\[" <*> go
+  pure $ Txt s
+  where
+  go = do
+    s <- line
+    if take 2 (reverse s) == "]\\" then pure s else (s++) . ('\n':) <$> go
+
+litblock = do
+  n <- length <$> some (char '-') <* char '\n'
+  when (n < 4) $ bad "want at least 4 dashes"
+  Nd "pre" . (:[]) . Txt <$> go n
+  where
+  go n = do
+    s <- line
+    if all (== '-') s && length s == n then pure "" else (s++) . ('\n':) <$> go n
+
+line = many (sat (/= '\n')) <* char '\n'
+
+heading = do
+  lvl <- some (char '=') <* some (char ' ')
+  s <- reverse <$> line
+  let
+    (a, b) = span (== '=') s
+    (sp, c) = span (== ' ') b
+  pure . Nd "h2". (:[]) . Txt . reverse
+    $ if lvl == a && not (null sp) then c else s
+
+sub tag ch s
+  | (pre, _:s1) <- break (== ch) s, (t, _:post) <- break (== ch) s1 = ([Txt pre, Nd tag [Txt t]]++) $ sub tag ch post
+  | otherwise = [Txt s]
+
+sublist tag ch = concatMap \case
+  Txt t -> sub tag ch t
+  Nd s xs | s /= "code" -> [Nd s $ sublist tag ch xs]
+  x -> [x]
+
+suball = sublist "strong" '*' . sublist "em" '_' . sublist "code" '`'
+
+paragraph = do
+  r <- go
+  if null r then bad "EOF" else pure . Nd "p" $ suball [Txt r]
+  where
+  go = eof *> pure "" <|> do
+    s <- line
+    if all isSpace s then pure [] else (s++) . ('\n':) <$> go
+
+passthrough = do
+  n <- length <$> some (char '+') <* char '\n'
+  when (n < 4) $ bad "want at least 4 pluses"
+  Txt <$> go n
+  where
+  go n = do
+    s <- line
+    if all (== '+') s && length s == n then pure "" else (s++) . ('\n':) <$> go n
+
+list = list' []
+list' parentMarkers = do
+  space
+  marker <- lookahead $ some (oneOf "*-")
+  when (elem marker parentMarkers) $ bad "parent"
+  let
+    item = do
+      string marker
+      many $ char ' '
+      Nd "li" . suball . (:[]) . Txt <$> line
+  Nd "ul" <$> some (item <|> list' (marker:parentMarkers))
+
+bloat = \case
+  Txt s -> (s++)
+  Nd "attr" (h:as) -> ("<div class='"++) . foldr (.) id (bloatAttr <$> as) . ("'>"++) . bloat h . ("</div>\n"++)
+  Nd "img" [Txt f] -> ("<img src='"++) . (f++) . ("'>"++)
+  Nd s kids -> ('<':) . (s++) . ('>':) . foldr (\x y -> bloat x . y) id kids . ("</"++) . (s++) . (">\n"++)
+
+bloatAttr = \case
+  Txt ('.':cl) -> (" "++) . (cl++)
+  _ -> id
+------------------------------------------------------------------------
+
+== Act I: Combinators ==
+
+[.hs]
+------------------------------------------------------------------------
+cover = [r|
+
+++++
+<div
+style='width:100vw;text-align:center;height:90vh;display:table-cell;vertical-align:middle;'
+><h2 style='border:none;'>MacGyver's Haskell Compiler</h2>
+Combinators, Duct Tape, and Two Minutes
+</div>
+++++
+
+|]
+
+aboutMe = [r|
+= About Me =
+
+&#x1F466; Undergrad: was taught OOP; FP = fringe
+
+  * saw HUGS once: slow toy language
+  * 3rd ICFP Programming Contest: Eiffel
+
+&#x1F468; Grad: cryptography
+
+  * rebelled against OOP, wrote C
+
+&#x1F474; Real World: non-FP jobs
+
+  * dabbled in Haskell
+|]
+
+Right prop = parse boolExpr "a*~b => c+d"
+
+boolMagic = [r|
+= Propositional Magic =
+
+Pick a Boolean expression, any Boolean expression.
+
+[.pause]
+\[
+|] ++ texShow 0 prop [r|
+\]
+
+[.pause]
+Watch closely... &#x1FA84;
+
+[.pause1]
+[.center]
+--------
+|] ++ nandShow (nandify prop) [r|
+--------
+
+[.pause1]
+Where did the logic symbols go?!
+&#x1F632;
+
+|]
+
+sheffer = [r|
+= Secret: NAND =
+
+\[
+A B = \neg (A \wedge B)
+\]
+
+Peirce 1880 (unpublished), Stamm 1911, Sheffer 1913, ...
+
+\[
+\begin{align}
+A \iff B &\rightsquigarrow& (A \implies B) \wedge (B \implies A) \\
+A \implies B &\rightsquigarrow& \neg A \vee B \\
+A \vee B &\rightsquigarrow& (\neg A)(\neg B) \\
+A \wedge B &\rightsquigarrow& \neg(A B) \\
+\neg A &\rightsquigarrow& A A \\
+\end{align}
+\]
+
+NAND is _functionally complete_.
+
+Moon landing used the dual (NOR) &#x1F680; &#x1F319;
+|]
+
+sharing = [r|
+= Sharing =
+
+\[
+\neg A = A A
+\]
+
+Duplicate circuit A?
+
+[.center]
+--------
+|] ++ nandShow (nandify prop) [r|
+--------
+
+No! Split wire, feed output to both inputs of NAND gate.
+
+[.center]
+--------
+|] ++ nandShow (shareNandify prop) [r|
+--------
+
+lazy evaluation, call-by-need, common subexpression elimination, hash consing, memoization, flyweight pattern, code reuse, top-down dynamic programming, dynamic linking, automatic differentiation, ...
+|]
+
+Right johnStuartMill = parse hol "(forall x . Man x => Mortal x) * Man Socrates => Mortal Socrates"
+
+Right usb = parse hol "forall f . exists g . forall x . ~(f x & g x)"
+
+predMagic = [r|
+= Higher-Order Magic =
+
+Pick a higher-order logic formula, any higher-order logic formula.
+
+\[
+|] ++ texShow 0 johnStuartMill [r|
+\]
+
+"All men are mortal, Socrates is a man, therefore Socrates is mortal"
+
+Nothing up my sleeve... &#x1FA84;
+
+[.pause]
+--------
+|] ++ nandShow (shareUnandify johnStuartMill) [r|
+--------
+
+[.pause]
+No higher-order logic symbols!
+&#x1F632;
+|]
+
+predSecret = [r|
+= Secret: universally quantified NAND =
+
+\[
+x.A B = \forall x . \neg (A \wedge B)
+\]
+
+Schönfinkel 1920:
+
+\[
+\begin{align}
+\exists x . A &\rightsquigarrow& \neg \forall x . \neg A \\
+\forall x . A &\rightsquigarrow& x . (\neg A) (\neg A) \\
+A \iff B &\rightsquigarrow& (A \implies B) \wedge (B \implies A) \\
+A \implies B &\rightsquigarrow& \neg A \vee B \\
+A \vee B &\rightsquigarrow& \_.(\neg A)(\neg B) \\
+A \wedge B &\rightsquigarrow& \neg (\_.A B) \\
+\neg A &\rightsquigarrow& \_.A A \\
+\end{align}
+\]
+
+|]
+
+varless = [r|
+= USB Trick =
+
+Next volunteer:
+
+\[
+|] ++ texShow 0 usb [r|
+\]
+
+Logic symbols begone! &#x1FA84;
+
+[.pause]
+[.center]
+--------
+|] ++ nandShow (unandify usb) [r|
+--------
+
+[.pause]
+Watch carefully... &#x1FA84;
+
+[.pause1]
+[.center]
+--------
+|] ++ shows (kis $ deBruijn $ unandLamb $ unandify usb) [r|
+--------
+
+[.pause1]
+All variables have vanished! &#x1F632;
+
+|]
+
+varlessSecret1 = [r|
+= Preprocessing =
+
+Instead of ad hoc notation:
+
+[.center]
+--------
+|] ++ nandShow (unandify usb) [r|
+--------
+
+write as lambda term using \(U f g = \forall a. \neg (f a \wedge g a)\)
+
+--------
+|] ++ lambShow 0 (unandLamb $ unandify usb) [r|
+--------
+
+|]
+
+varlessSecret2 = [r|
+= Secret: Combinators =
+
+Schönfinkel 1920: _combinators_ are cleverly chosen functions:
+
+\[
+\begin{align}
+S x y z &=& x z (y z) \\
+B x y z &=& x   (y z) \\
+\end{align}
+\]
+
+--------
+|] ++ lambShow 0 (unandLamb $ unandify usb) [r|
+--------
+
+_Bracket abstraction_: lambdas &dzigrarr; combinators
+
+[.center]
+--------
+|] ++ shows (kis $ deBruijn $ unandLamb $ unandify usb) [r|
+--------
+
+|]
+
+skk = [r|
+= Identity crisis =
+
+Given S and K combinators:
+
+--------
+S x y z = x z (y z)  -- Reader instance of (<*>)
+K x y = x            -- const
+--------
+
+&#x1F914;
+How to build the identity function? `\x -> x`
+
+[.pause]
+`K K`? But `K K x = K`. We have `K x K = x` but lack C (aka `flip`) for `C K K`.
+
+[.pause1]
+Solution: `S K K -- Haskell: (<*>) const const`
+
+[.pause1]
+--------
+S K K x = K x (K x) = x
+--------
+
+[.pause1]
+What else can we build from S and K?
+|]
+
+skAlgorithm = [r|
+= SK bracket abstraction =
+
+S and K are Turing complete: can create any lambda term:
+
+\[
+\begin{align}
+\lambda x . x &\rightsquigarrow& S K K \\
+\lambda x . y &\rightsquigarrow& K y \\
+\lambda x . A B &\rightsquigarrow& S (\lambda x . A) (\lambda x . B)  \\
+\end{align}
+\]
+
+--------
+|] ++ shows (skAbstract $ unandLamb $ unandify usb) [r|
+--------
+
+Will talk about a better algorithm if time allows.
+|]
+
+eliminateU = [r|
+= Two's company =
+
+Make U implicit:
+
+--------
+|] ++ lambShow 0 (unandLamb $ unandify usb) [r|
+--------
+
+Prepend `"\U ->"`, bracket abstraction: &#x1FA84;
+
+[.pause]
+--------
+|] ++ shows (skOnly $ kis $ deBruijnWith ["U"] $ unandLamb $ unandify usb) [r|
+--------
+
+[.pause]
+Can write any logic formula with just S and K.
+
+|]
+
+lastCombinator = [r|
+= Last combinator standing =
+
+Fokker 1992: Define \( X = \lambda f.f S (\lambda x y z. x) \).
+
+--------
+|] ++ shows (skOnly $ kis $ deBruijnWith ["U"] $ unandLamb $ unandify usb) [r|
+--------
+
+Then \( K = X X, S = X(X X) \)
+
+--------
+|] ++ shows (skTo "X" $ skOnly $ kis $ deBruijnWith ["U"] $ unandLamb $ unandify usb) [r|
+--------
+
+|]
+
+justTrees = [r|
+= And then there were none =
+
+Write X as (): &#x1F332;
+
+--------
+|] ++ shows (skTo "()" $ skOnly $ kis $ deBruijnWith ["U"] $ unandLamb $ unandify usb) [r|
+--------
+
+Or remove parentheses with prefix operator aka Polish notation `oAB = (AB)`
+
+--------
+|] ++ polishShow (skTo "X" $ skOnly $ kis $ deBruijnWith ["U"] $ unandLamb $ unandify usb) [r|
+--------
+
+(Łukasiewicz 1929)
+
+|]
+
+combsummary = [r|
+= Combinators: the ultimate building blocks =
+
+NAND: Functionally complete. Generates all Boolean expressions.
+
+{S, K}: Turing complete. Generates all lambda terms. (Such as lambda encoding of NAND!)
+
+Arose from logic ("combinatory logic"; "building blocks of logic") but go
+beyond. Building blocks of lambda calculus. Of computation.
+
+&#x1F9F1; By chance we use BRICKS combinators. (SK alone is clunky.)
+|]
+
+bricks = [r|
+= A VM built with BRICKS =
+
+Combinator intepreters are simple:
+
+--------
+      case 'B': lazy(3,       arg(1), apparg(2, 3)); break;  // Bxyz = x(yz)
+      case 'R': lazy(3, apparg(2, 3),       arg(1)); break;  // Rxyz = yzx
+      case 'I': sp[1] = arg(1); sp++;                break;  // Ix   = x
+      case 'C': lazy(3, apparg(1, 3),       arg(2)); break;  // Cxyz = xzy
+      case 'K': lazy(2,          'I',       arg(1)); break;  // Kx   = x
+      case 'S': lazy(3, apparg(1, 3), apparg(2, 3)); break;  // Sxyz = xz(yz)
+      case ':': lazy(4, apparg(4, 1), arg(2)); break;
+      case 'T': lazy(2, arg(2), arg(1)); break;
+      case 'Y': lazy(1, arg(1), sp[1]); break;
+--------
+
+...plus primitives like Int arithmetic.
+
+Haskell BRICKS: `(.), flip flip, id, flip, const, (<*>)`
+|]
+
+timeline1 = [r|
+= Combinators: the original building blocks =
+
+1920 - Moses Schönfinkel invents combinators, tells Göttingen Mathematical Society
+
+1926 - Haskell Curry rediscovers combinators
+
+1928 - Alonzo Church invents lambda calculus
+
+1932 - Church publishes lambda calculus
+
+1937 - Alan Turing publishes _On Computable Numbers_
+|]
+
+timeline2 = [r|
+= History is messy =
+
+1924 - Heinrich Behmann publishes Schönfinkel's ideas + his own ideas (one wrong).
+Bracket abstraction: "We will not give the complete demonstration here but only
+explain the role of the different particular functions in this reduction."
+
+1925 - John von Neumann publishes combinator-like things (inspired by Schönfinkel?) with a "reduction theorem"; "we do not go into the very simple proof".
+
+1927 - Curry learns of Schönfinkel's work
+
+1930 - Curry publishes complete demonstration with BCKW
+
+1950 - Rosenbloom publishes SK algorithm
+
+Hindley, _History of lambda-calculus and combinatory logic_
+|]
+
+scanfinkel = [r|
+[.img95]
+image::schon.png[]
+|]
+
+fastforward = [r|
+= Combinators: the historic building blocks =
+1966 - Peter Landin invents ISWIM (+ 699 more languages); "Church without lambda"
+
+1967 - ISWIM inspires PAL.
+
+1972 - David Turner invents SASL, inspired by PAL. One compiler uses combinators.
+
+1979 - KRC = succ SASL. One compiler uses combinators.
+
+1985 - Miranda = succ SASL/KRC. Uses combinators.
+
+1987 - Haskell ~ succ Miranda. Uses combinators.
+|]
+
+combobreak = [r|
+199? - GHC encounters issues with combinators.
+
+  * Tries supercombinators (compiler invents specialized combinators for each program)
+  * Abandons combinators for STG, the Spineless Tagless G-Machine
+
+2018 - Oleg Kiselyov publishes new abstraction algorithm. "Perhaps combinators as the compilation target of real functional languages deserve a second look."
+
+Let's take a look!
+|]
+------------------------------------------------------------------------
+
+== Intermission: two-minute compiler ==
+
+[.hs]
+------------------------------------------------------------------------
+twoMinutes = [r|
+= Build a Haskell compiler in 2 minutes =
+
+----
+$ git clone https://github.com/blynn/zh23 && cd zh23
+$ time make precisely
+$ time make reply  # Compiles REPL edition of itself.
+$ ./reply
+> product [1..10]
+----
+
+++++
+<textarea rows="10" style="width:100%;" spellcheck="false"></textarea>
+++++
+|]
+------------------------------------------------------------------------
+
+== Act II: Lambdas ==
+
+[.hs]
+------------------------------------------------------------------------
+intocomb = [r|
+= Into combinators: squeezing Haskell into BRICKS =
+
+--------
+compile = parse >>= typeCheck >>= toLambda >>= bracketAbstract
+
+parse           :: String -> AST
+typeCheck       :: AST    -> AST
+toLambda        :: AST    -> Lambda
+bracketAbstract :: Lambda -> Combinator
+--------
+
+`bracketAbstract`: Done! (Ineffciently.)
+
+`toLambda`: How to rewrite everything as lambda terms?
+|]
+
+intolamb = [r|
+= Into lambdas: squeezing Haskell into Var | Lam | App =
+
+--------
+data Term = Var String
+          | Lam Var Term
+          | App Term Term
+--------
+
+Functions ("Church without lambda"):
+
+[.center]
+`f x y = rhs` &dzigrarr; `f = \x y -> rhs`
+
+Let:
+
+[.center]
+`let x = t in rhs` &dzigrarr; `(\x -> rhs) t`
+
+But data types? case? recursion? mutual recursion?
+|]
+
+scottencoding = [r|
+= Data =
+
+&#x1F914;
+How to turn data types into lambda terms?
+
+-----
+data Mono = Kono Bool | Sono | Ano Int Char
+-----
+
+Hint: what is the only meaningful thing we can do with a `Mono` value?
+
+[.pause]
+&#x1F50D; Answer: scrutinize with `case`
+
+[.pause]
+-----
+scrutinize value = case value of
+  Kono x  -> doThis (not x)
+  Sono    -> doThat
+  Ano x y -> doTheOther y (x*x)
+-----
+|]
+
+scottencoding2 = [r|
+= Scott Encoding =
+
+-----
+scrutinize value = case value of
+  Kono x  -> doThis (not x)
+  Sono    -> doThat
+  Ano x y -> doTheOther y (x*x)
+-----
+
+&#x1F937; Naively force `case` to be a lambda term:
+
+-----
+scrutinize value = value
+  (\x   -> doThis (not x))
+  (\    -> doThat)
+  (\x y -> doTheOther y (x*x))
+-----
+
+&#x1F44D; The Scott encoding is the lambda term that makes it work.
+
+-----
+Ano 42 'B' = \f g h -> h 42 'B'
+Ano = \x y f g h -> h x y
+-----
+|]
+
+scottencoding3 = [r|
+= Scott Encoding Examples =
+
+-----
+True  = \x y -> x
+False = \x y -> y
+
+(,) = \x y f -> f x y
+
+Left  = \x f g -> f x
+Right = \x f g -> g x
+
+[]  = \    f g -> f
+(:) = \x y f g -> g x y
+
+Nothing = \  f g -> f
+Just    = \x f g -> g x
+-----
+
+Booleans: I prefer the other way around, but it's Church dogma.
+|]
+
+mutrec1 = [r|
+= Mutual Recursion =
+
+Which defined first?
+&#x1F414;
+&#x1F95A;
+
+-----
+chicken = sequence [lay egg, cross road, otherFowlDeeds]
+egg     = become chicken
+-----
+
+[.pause]
+Solution: use a placeholder to mostly define one first.
+
+[.pause]
+-----
+chicken1 = \e -> sequence [lay e, cross road, otherFowlDeeds]
+egg      = become (chicken1 egg)
+chicken  = chicken1 egg
+-----
+
+[.pause]
+Mutual recursion &dzigrarr; single recursion.
+
+[.pause1]
+It's like the first word of this sentence, which is a placeholder whose
+meaning we supply later. ("It's sunny." "It takes one to know one.")
+|]
+
+placeholderdef = [r|
+placeholder: an element of a sentence that is required by syntactic constraints
+but carries little or no semantic information, for example the word _it_ as a
+subject in _it is a pity that she left_, where the true subject is _that she
+left_. |]
+
+mutrec2 = [r|
+May need multiple placeholders.
+&#x1F98B;
+
+-----
+larva = sequence [insult imago, become pupa]
+pupa  = sequence [admonish larva, become imago]
+imago = sequence [find imago, lay egg]
+egg   = become larva
+-----
+
+Becomes:
+
+-----
+larva1 = \p i e -> sequence [insult (i e), become (p i e)]
+pupa1  =   \i e -> sequence [admonish (larva1 pupa1 i e), become (i e)]
+imago1 =     \e -> sequence [find (imago1 e), lay e]
+egg    =           become (larva1 pupa1 imago1 egg)
+larva  = larva1 pupa1 imago1 egg
+pupa   = pupa1 imago1 egg
+imago  = imago1 egg
+-----
+
+(alternate strategy for `let`: placeholders + move all definitions to top
+level; _lambda lifting_)
+|]
+
+recursion1 = [r|
+= Recursion =
+
+--------
+fib = \n -> if n <= 1 then n else fib (n - 1) + fib (n - 2)
+--------
+
+&#x1F407;&#x1F407;
+Mostly define it with a placeholder?
+
+--------
+fib1 = \x n -> if n <= 1 then n else x (n - 1) + x (n - 2)
+--------
+
+&#x1F407;&#x1F407;&#x1F407;
+Then `fib = fib1 fib1`? No! RHS is wrong:
+
+--------
+... fib1 (n - 1) + fib1 (n - 2)
+--------
+
+&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;
+As before, we must pass placeholders to placeholders...
+
+--------
+... x x (n - 1) + x x (n - 2)
+--------
+
+|]
+
+recursion2 = [r|
+&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;
+
+Modify RHS?
+
+--------
+fibYucky = \x n -> if n <= 1 then n else x x (n - 1) + x x (n - 2)
+fib = fibYucky fibYucky
+--------
+
+&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;
+
+Works! But headache to construct; duplicates `x x`.
+
+&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;&#x1F407;
+
+Better: keep `fib1` (well-typed and pretty), spin-off naughty parts:
+
+--------
+fib1 = \n -> if n <= 1 then n else x (n - 1) + x (n - 2)
+fib2 = \x -> fib1 (x x)
+fib = fib2 fib2
+--------
+
+Recursion &dzigrarr; no recursion!
+
+|]
+
+recursion3 = [r|
+Generalize for any function `f` like `fib1`:
+
+--------
+makeRecursive f = f2 f2 where f2 = \x -> f (x x)
+--------
+
+Known as the _Y combinator_ (Rosenbloom 1950)
+
+\[
+\begin{align}
+Y &=& \lambda f. (\lambda x . f(x x))(\lambda x . f(x x)) \\
+  &=& \lambda f. (\lambda x . x x)(\lambda x . f(x x)) \\
+\end{align}
+\]
+
+1930s: Curry was a living breathing Y combinator!
+
+[.center]
+image::ycurry.png[]
+
+|]
+
+fixedpoint = [r|
+= Fixed-point combinators =
+
+--------
+fib1 x = ... x (n - 1) + x (n - 2)
+--------
+
+Make it recursive with Y:
+
+--------
+(Y fib1) = ... (Y fib1) (n - 1) + (Y fib1) (n - 2)
+--------
+
+Get same RHS when `x = Y fib1`:
+
+--------
+fib1 (Y fib1) = ... (Y fib1) (n - 1) + (Y fib1) (n - 2)
+--------
+
+Hence `fib1 (Y fib1) = Y fib1`; we call Y a _fixed-point combinator_:
+
+[.center]
+--------
+f (Y f) = Y f
+--------
+
+Any fixed-point combinator enables recursion.
+
+|]
+
+ycompile = [r|
+= Compiling recursion to combinators =
+
+Rewrite recursive definitions with placeholders and Y.
+
+--------
+maybeFix s x = if go x then A (E $ Basic "Y") (L s x) else x where
+  go = \case
+    V v -> s == v
+    A x y -> go x || go y
+    L v x -> s /= v && go x
+    _ -> False
+--------
+
+If type-checker asks, pretend Y has type `(a -> a) -> a`
+
+VM: hard-wire fixed-point reduction instead of `Y=B(SII)(R(SII)B)`
+(or `&theta;=SII(B(SI)(SII))`)
+
+--------
+      case 'Y': lazy(1, arg(1), sp[1]); break;  // Y f = f (Y f)
+--------
+
+Top-level: Cheat! Forget theory, use memory addresses.
+|]
+
+factorialExample = [r|
+= Factorial =
+
+Source:
+
+--------
+fac n = if 1 < n then n * fac (n - 1) else 1
+--------
+
+Scott encoding; Y combinator:
+
+--------
+fac = Y \x n -> (1 < n) (n * x (n - 1)) 1
+--------
+
+Bracket abstraction:
+
+--------
+fac = Y(B(R 1)(B(S((<) 1))(B(S (*))(R(R 1 (-)) B))))
+--------
+|]
+
+factorialExample2 = [r|
+= Recursion Remystified =
+
+Fun: translate back to Haskell!
+
+--------
+import Data.Function
+r = flip flip
+pred2 p a1 a2 = if p a1 a2 then const else const id
+
+fac = fix $ r 1 . (pred2(<)1<*>) . ((*)<*>) . (r(r 1(-))(.))
+--------
+|]
+
+theta = [r|
+= History is messy =
+
+First published fixed-point combinator was Turing 1937. Want:
+
+\[
+\Theta y = y (\Theta y)
+\]
+
+Placeholder:
+
+\[
+\Theta' x y = y (x x y)
+\]
+
+Solution is \(\Theta = \Theta' \Theta'\):
+
+\[
+\begin{align}
+\Theta &=& (\lambda x y . y(x x y))(\lambda x y . y(x x y)) \\
+       &=& (\lambda x . x x) (\lambda x y . y(x x y)) \\
+\end{align}
+\]
+|]
+
+ioccc = [r|
+= Into IOCCC: squeezing Haskell into 4k =
+
+"Most functional compiler" of 26th International Obfuscated C Code Contest (2019)
+
+Size restrictions: at most 2053 tokens, at most 4096 bytes.
+
+No GC. No types. No operator precedence. No layout. Fussy case expressions.
+
+Compiler in Haskell, compiled to combinators. VM and decoder in C.
+
+Exploit tokenization rules: encode data in whitespace, braces, and semicolons.
+
+Huffman-encode combinators, base-85 to avoid high-bit chars.
+|]
+
+copypasta = [r|
+= Copy and paste you a compiler! =
+
+* bracket abstraction: Kiselyov 2018, _&lambda; to SKI, Semantically_
+* type checking: Jones 1999, _Typing Haskell in Haskell_
+* type classes: Peterson and Jones 1993, _Implementing type classes_
+* parsing combinators: Swierstra 2008, _Combinator Parsing: A Short Tutorial_
+* Scott encoding, primitives: Naylor and Runciman 2012, _The Reduceron reconfigured and re-evaluated_
+* lambda lifting, strongly connected components: Peyton Jones 1987, _The Implementation of Functional Programming Languages_
+* big integers: Knuth, _The Art of Computer Programming Volume 2_
+
+&#x1F9E0; Brain only needed for combinator-reducing VM.
+|]
+
+haskellForMe = [r|
+= Haskell For Me =
+
+(a,b,c) means (a,(b,c)); one instance handles all tuples.
+
+`Ring` typeclass. Gaussian integers for 2D games.
+
+built-in raw string quasiquotes.
+
+empty lambda `\ -> foo` means 'foo`.
+
+`BlockArguments LambdaCase TupleSections LexicalNegation ...`
+
+non-dreadful: let not generalized + no monomorphism restriction.
+|]
+
+------------------------------------------------------------------------
+
+== Act III: Plot Twists ==
+
+[.hs]
+------------------------------------------------------------------------
+selfHost1 = [r|
+= Self-Hosting Compiler 1/5 =
+
+prelude
+
+--------
+or f g x y = f x (g x y);
+and f g x y = @C f y (g x y);
+lsteq = @Y \r xs ys a b -> xs (ys a (\u u -> b)) (\x xt -> ys b (\y yt -> x(y(@=)) (r xt yt a b) b));
+pair x y f = f x y;
+just x f g = g x;
+foldr = @Y \r c n l -> l n (\h t -> c h(r c n t));
+append = @C (foldr @:);
+--------
+
+syntax tree = lambda term
+
+--------
+-- data LC = Raw Char | Var String | App LC LC | Lam String LC
+lcr s   = \a b c d -> a s;
+lcv v   = \a b c d -> b v;
+lca x y = \a b c d -> c x y;
+lcl x y = \a b c d -> d x y;
+--------
+
+|]
+
+selfHost2 = [r|
+= Self-Hosting Compiler 2/5 =
+
+parser combinators
+
+--------
+pure x inp = just (pair x inp);
+sat f inp = inp @K (\h t -> f h (pure h t) @K);
+bind f m = m @K (\x -> x f);
+ap x y = \inp -> bind (\a t -> bind (\b u -> pure (a b) u) (y t)) (x inp);
+fmap f x = ap (pure f) x;
+alt x y = \inp -> (x inp) (y inp) just;
+liftaa f x y = ap (fmap f x) y;
+many = @Y \r p -> alt (liftaa @: p (r p)) (pure @K);
+some p = liftaa @: p (many p);
+char c = sat (\x -> x(c(@=)));
+liftki = liftaa (@K @I);
+liftk = liftaa @K;
+--------
+|]
+
+selfHost3 = [r|
+= Self-Hosting Compiler 3/5 =
+
+lexer
+
+--------
+com = liftki (char #-) (liftki (char #-) (liftki (many (sat (\c -> @C (c(#
+(@=)))))) (char #
+)));
+sp = many (alt (sat (\c -> or (c(# (@=))) (c(#
+(@=))))) com);
+spc f = liftk f sp;
+spch = @B spc char;
+var = spc ( some (sat (\x -> and (#z(x(@L))) (x(#a(@L))) )));
+anyone = fmap (@C @: @K) (spc (sat (@K @K)));
+pre = alt (liftki (char #@) anyone) (liftaa @: (char ##) anyone);
+--------
+|]
+
+selfHost4 = [r|
+= Self-Hosting Compiler 4/5 =
+
+parser
+
+--------
+lam r = liftki (spch #\) (liftaa (@C (foldr lcl)) (some var) (liftki (char #-) (liftki (spch #>) r)));
+atom r = alt (alt (alt (liftki (spch #() (liftk r (spch #)))) (lam r)) (fmap lcr pre)) (fmap lcv var);
+apps = @Y \rr r -> alt (liftaa @T (atom r) (fmap (\vs v x -> vs (lca x v)) (rr r))) (pure @I);
+expr = @Y \r -> liftaa @T (atom r) (apps r);
+
+def = liftaa pair var (liftaa (@C (foldr lcl)) (many var) (liftki (spch #=) expr));
+program = liftki sp (some (liftk def (spch #;)));
+--------
+|]
+
+selfHost5 = [r|
+= Self-Hosting Compiler 5/5 =
+
+bracket abstraction, symbol table, show
+
+--------
+rank ds v = foldr (\d t -> lsteq v (d @K) (\n -> @: #@ (@: n @K)) (@B t \n -> # (#!(@-))(n(@+)) )) (@K v) ds # ;
+show = @Y \r ds t -> t @I (rank ds) (\x y -> @:#`(append (r ds x) (r ds y))) @?;
+isfree = @Y(\r v t -> t (\x -> @K @I) (\x -> lsteq v x) (\x y -> or (r v x) (r v y)) (\x y -> @C (or (lsteq v x) (@C (r v y)))));
+unlam = @Y(\r v t -> isfree v t (t @? (@K (lcr (@:#I@K))) (\x y -> lca (lca (lcv (@:#S@K)) (r v x)) (r v y)) @?) (lca (lcv (@:#K@K)) t));
+babs = @Y(\r t -> t lcr lcv (\x y -> lca (r x) (r y)) (\x y -> unlam x (r y)));
+dump = @Y \r tab ds -> ds @K \h t -> append (show tab (babs (h (@K @I)))) (@: #; (r tab t));
+main s = program s (@:#?@K) (@B (\ds -> dump ds ds) (@T @K));
+--------
+|]
+
+selfHostOut = [r|
+= VM Bytecode =
+
+--------
+``S``S`KS``S`KK``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI`K``S``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI`K`KI;`Y``S`K`S``S`KS``S`K`S`KS``S`K`S`K`S`KS``S``S`KS``S`KK``S`KS``S`KK``S`KS``S`KKI`K``S``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI`K`K``S`KK``S`KKI``S`KK``S`K`S``S`KS``S`KK``S`KS``S`K`S`KS``S`K`S`KK``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI``S`KK``S``S`KS``S`K`S`KS``S`K`S`K`S`KS``S`K`S`K`S`K`S`KS``S`K`S`K`S`K`S`K`S`KS``S`K`S`K`S`K`S`K`S`K`S`KS``S`K`S`K`S`K`S``S`KS``S`KK``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`K``SI`K=``S`K`S`K`S`KK``S`K`S`K`S`K`S`KK``S``S`KS``S`K`S`KS``S`K`S`KK``S`K`S`KS``S`K`S`K`S`KS``S``S`KS``S`KK``S`KS``S`K`S`KS``S``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI`K`KI`K``S`KK``S`KKI`K`K``S`KK``S`KKI`K`K``S`KK``S`KK``S`KK``S`KKI;`Y``S`K`S``S`KS``S``S`KS``S`KKI`KI``S`KK``S`K`S`K`S``S`KS``S`KK``S`K:I``S`K`S`KK``S``S`KS``S`KK``S`KS``S``S`KS``S`KKI`KI`K``S`KKI;``S``S`KS``S`KK``S`KS``S`K`SI``S`KKI`K``S`KKI;``S`KK``S`K`SI``S`KKI;``S`K`S`K@$``S``S`KS``S`KK``S`K@#I`KI;``S`K`S``SI`KK``S`KK``S``S`KS``S`K`S`KS``S``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI`K``S``S`KS``S`KK``S`K@%I`KI`K`K`KK;``S`K`S``SI`KK``S`KK``S`K`SI``S`KKI;``S`K`S``S`KS``S`KK``S`K@'``S`K`S``S`KS``S`KK``S`K@'``S``S`KS``S`K`S`KS``S`K`S`KK``S`K`S`K@%``S``S`KS``S`KKI`KI`K`KI``S`KK``S``S`KS``S`KKI`KI``S`KK``S``S`KS``S`KKI`KI;``S``S`KS``S`KK``S`K@(``S`K@%I`KI;``S``S`KS``S`K`S`KS``S``S`KS``S`KK``S`KS``S``S`KS``S`KKI`KI`K``S``S`KS``S`KKI`KI`K`K`K@$;`Y``S`K`S`K`S``S`KS``S`K`SI``S`KKI``S`K`S`K`S`KK``S`K`S``S`KS``S`KK``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI``S`K`S`K`S`KK``S``S`KS``S`K`S`KS``S`K`S`K`S`KS``S`K`S`K`S`KK``S``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI`K`KI`K`K`KI;``S``S`KS``S`K`S`KS``S`K`S`KK``S`K`S`K@(``S``S`KS``S`KK``S`K@)I`KI`K`KI;`Y``S``S`KS``S`K`S`K@*``S`K`S``S`K`@,:I``S``S`KS``S`KKI`KI`K`K`@%K;``S``S`K`@,:I``S`K@-I;``S`K@&``S`K`SI``S`KK``SI`K=;`@,`KI;`@,K;``@0`@/#-``@0`@/#-``@0`@-`@&``S`KC``SI`K`#
+=`@/#
+;`@-``@*`@&``S``S`K@ ``SI`K`# =``SI`K`#
+=@2;``S``S`K@1I`K@3;``B@4@/;``S``S`KS``S`KK``S`KS``S`KK``S`KS``S``S`KS``S`KK``S`KCI`KI`K``S``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI`K`KI;`@4`@.`@&``S``S`K@6``S`K#z``SI`KL``SI`K`#aL;``S`K`S`KK``S`K`S`KK``S`K`S`KK``S`K`SI``S`KKI;``S`KK``S`K`S`KK``S`K`S`KK``S`K`SI``S`KKI;``S`K`S`KK``S`K`S`KK``S`K`S`K`S`KK``S``S`KS``S`KK``S`KS``S`K`SI``S`KKI`K``S`KKI;``S`K`S`KK``S`K`S`KK``S`K`S`KK``S``S`KS``S`KK``S`KS``S`K`SI``S`KKI`K``S`KKI;``@)``C:K`@4`@&`KK;``@*``@0`@/#@@<```@,:`@/##@<;``S`K`@0`@5#\``S`K``@,`C`@+@;`@.@7``S`K`@0`@/#-``S`K`@0`@5#>I;``S``S`K@*``S``S`K@*``S``S`K@*``S`K`@0`@5#(``S``S`K@1I`K`@5#)``S`K@>I`K``@)@8@=`K``@)@9@7;`Y``S``S`KS``S`K`S`K@*``S`K`S``S`K`@,T``S`K@?I``S`K`S`K`@)``S``S`KS``S`KK``S`KS``S`KKI`K``S`K`S``S`K@:I``S`KKI``S``S`KS``S`KKI`KI`K`K`@%I;`Y``S``S`K`@,T``S`K@?I``S`K@@I;```@,@#@7```@,`C`@+@;`@-@7``@0`@5#=@A;``@0@3`@.``@1@B`@5#;;``S``S`KS``S`K`S``S``S`K@+``S``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S``S`KS``S`KK``S`K@!I`K``SI`KK`K`K``S`K`:#@``S``S`K:I`KK`K`K``S``S`KBI`K``S`K`# `#!-``SI`K+``S`KKI``S`KKI`K`K# ;`Y``S``S`KS``S`K`S`KS``S`K`S``S`KS``S`K`S``SI`KI``S`KK``S`K@DI``S`K`S`KK``S`K`S`K`S`K`S`K`:#```S``S`KS``S`K`S`KS``S`K`S`K`S`KS``S`K`S`K`S`KK``S`K`S`K`S`K@"``S``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI`K`KI``S`K`S`KK``S``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI`K`KI`K`K`K?;`Y``S``S`KS``S`K`S`KS``S`K`S``S`KS``S`K`S``SI`K`K`KI``S`KK``S``S`KS``S`KK``S`K@!I`KI``S`K`S`KK``S``S`KS``S`K`S`KS``S`K`S`K`S`KS``S`K`S`K`S`KK``S`K`S`K`S`K@ ``S``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI`K`KI``S`K`S`KK``S``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI`K`KI``S`K`S`KK``S`K`S`K`S`K`S`KC``S`K`S``S`KS``S`K`S`KS``S`K`S`KK``S`K`S`K@ ``S``S`KS``S`KK``S`K@!I`KI``S`K`S`KK``S`K`S`K`S`KC``S``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI`K`KI;`Y``S``S`KS``S`K`S`KS``S`K`S``S`KS``S``S`KS``S`KK``S`K@FI`KI``S``S`KS``S`K`S`KS``S`K`S`K`S``S``SI`K?`K`K`@8``:#IK``S`K`S`KK``S``S`KS``S`K`S`KS``S`K`S`K`S`KS``S`K`S`K`S`KK``S`K`S`K`S`K@:``S`K`S`K`S`K`@:`@9``:#SK``S``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI`K`KI``S`K`S`KK``S``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI`K`KI`K`K`K?`K`K``S`K`@:`@9``:#KKI;`Y``S``S`KS``S`K`S``S``SI`K@8`K@9``S`KK``S``S`KS``S`K`S`KS``S`K`S`KK``S`K`S`K@:``S``S`KS``S`KKI`KI``S`KK``S``S`KS``S`KKI`KI``S`KK``S`K`S``S`KS``S`KK``S`K@GI``S`KK``S``S`KS``S`KKI`KI;`Y``S`K`S`K`S``SI`KK``S`K`S`KK``S`K`S``S`KS``S`K`S`KS``S`K`S`KK``S`K`S`K@"``S``S`KS``S`KK``S`K@EI`K``S`K@H``SI`K`KI``S`K`S`KK``S`K`S`K`S`K`:#;``S``S`KS``S`K`S`KS``S`K`S`KK``S``S`KS``S`KKI`KI`K`KI;``S``S``S`K@CI`K``:#?K`K``B``S``S`K@III`TK;
+--------
+|]
+
+predDemo = do
+  s <- getContents
+  case parse (space *> hol <* eof) s of
+    Left err -> jsEval $ "document.getElementById('unandliveOut').innerText = `" ++ err ++ "`;"
+    Right x -> do
+      jsEval $ "document.getElementById('unandliveTex').innerText = " ++ show ("\\(" ++ texShow 0 x "\\)") ++ ";"
+      jsEval $ "document.getElementById('unandliveOut').innerText = `" ++ nandShow (shareUnandify x) "" ++ "`;"
+
+widgetReveal = [r|
+= Live Magic Show! =
+
+Compile VM to wasm: run Haskell on web
+
+Canned examples? No! Really can pick any formula.
+
+++++
+<button id="unandliveSocrates">Socrates</button>
+<button id="unandliveRobbins">Robbins</button>
+<button id="unandliveFool">Fool</button>
+<button id="unandliveEqual">Equal</button>
+<div>
+<textarea id="unandlive" rows="2" style="width:90%;" spellcheck="false"></textarea>
+</div>
+<button id="unandliveGo">Go!</button>
+<p class="center" id="unandliveTex"></p>
+<pre id="unandliveOut"></pre>
+<div class="widget">
+const ta = document.getElementById("unandlive");
+document.getElementById("unandliveGo").addEventListener("click", (ev) => {
+  document.getElementById("unandliveTex").innerHTML = "";
+  document.getElementById("unandliveOut").innerHTML = "";
+  tedea(run("eval_expr", ["Main", "predDemo"], ta.value).out);
+  MathJax.typeset();
+});
+document.getElementById("unandliveSocrates").addEventListener("click", (ev) => {
+ta.value="(forall x . Man x => Mortal x) * Man Socrates => Mortal Socrates";
+});
+document.getElementById("unandliveRobbins").addEventListener("click", (ev) => {
+ta.value="~(~(a+b)+~(a+~b)) <=> a";
+});
+document.getElementById("unandliveFool").addEventListener("click", (ev) => {
+ta.value="(forall x . exists t . Fool x t)*(exists x . forall t . Fool x t)*~(forall x . forall t . Fool x t)";
+});
+document.getElementById("unandliveEqual").addEventListener("click", (ev) => {
+ta.value="forall x.forall y.forall z.f x x * (f x y => f y x) * (f x y * f y z => f x z)";
+});
+</div>
+++++
+|]
+
+compilerReveal = [r|
+= Live Compiler Show! =
+
+Compile VM to wasm: run Haskell compiler on web
+
+++++
+<div>
+<textarea id="repl" rows="5" style="width:90%;" spellcheck="false"></textarea>
+</div>
+<button id="replGo">Go!</button>
+<pre id="replOut">
+</pre>
+<div class="widget">
+const ta = document.getElementById("repl");
+document.getElementById("replGo").addEventListener("click", (ev) => {
+document.getElementById("replOut").innerText = tedea(run("chat", ["Main"], ta.value).out);
+});
+</div>
+++++
+
+|]
+
+slideReveal = [r|
+= Live Slide Show! =
+
+This webpage:
+
+  * loads a Haskell compiler wasm binary.
+  * then compiles + runs slideshow written in Haskell.
+
+Includes:
+
+* HTML markup tool
+* formula parsers
+* NAND rewriter
+* bracket abstraction
+
+Bubble VM page is similar.
+
+|]
+
+bootstrap = [r|
+= Bootstrapping a compiler =
+
+Hard &#x1F414; &#x1F95A; problem.
+
+--------
+ghc = runBinary ghc ghcSource
+--------
+
+Fixed-point combinator?
+
+--------
+ghc = fix $ flip runBinary ghcSource`
+--------
+
+Finds superficial solution `undefined` (the _least fixed point_).
+
+[.pause]
+Must do real work e.g. start from combinator VM in C:
+
+[.pause]
+--------
+$ cc compiler0.c -o compiler0
+$ ./compiler0 < compiler1.hs > compiler1
+$ ./compiler1 < compiler2.hs > compiler2
+...
+--------
+|]
+
+bootstrapGame = [r|
+= Bootstrapping Haskell Game =
+
+Goal: self-hosting Haskell compiler, starting from C (assembly?)
+
+Zachlike + Minecraft + Factorio + ...
+
+ACM contest conditions? Books and papers allowed but must type all code?
+
+Must preserve entire chain of compilers.
+|]
+
+bootTips = [r|
+= Speedrunning tips =
+
+Parser combinators rock!
+
+Tree decoration problem (_Trees That Grow_): hold nose, use one-size-fits-all.
+
+Pattern matching: start with simple slow version, then write faster version.
+
+Off-side rule (layout), do notation: support earlier than I did; easy with parser combinators
+
+IO monad, standalone compiler: I was too eager to add these.
+
+Fixity: separate fixity-fixing phase; my intermediate "simplified" hack was painful.
+
+Modules: should have thought about it earlier!
+|]
+
+deBruijnMagic = [r|
+= Bonus Magic =
+
+Pick a lambda term, any lamba term.
+
+\[
+\lambda f . f (\lambda x y z . x z (y z)) (\lambda a b c . a)
+\]
+
+Watch closely... &#x1FA84;
+
+[.pause]
+\[
+\lambda 0 (\lambda \lambda \lambda 2 0 (1 0)) (\lambda \lambda \lambda 2)
+\]
+
+[.pause]
+Names have disappeared!
+
+[.pause]
+Replaced with level of nesting: _De Bruijn index_
+|]
+
+deBruijnMagic2 = [r|
+= Lambda without lambda =
+
+What does a lambda-less sub-term mean?
+
+\[
+x z (y z)
+\]
+
+Adding 6 lambdas in different order: different meanings
+
+\[
+\lambda a b c x y z . x z (y z) \ne \lambda y a z b x c . x z (y z)
+\]
+
+Adding 6 &lambda;s to 20(10):
+
+\[
+\lambda \lambda \lambda \lambda \lambda \lambda 2 0 (1 0)
+\]
+
+This term has a unique meaning.
+|]
+
+kiselyovAmalg = [r|
+= Puzzle =
+
+Write \(n \models d\) for \(\lambda ... \lambda d (n-1) ... 0\), e.g:
+
+\[
+3 \models BK = \lambda \lambda \lambda B K 2 1 0
+\]
+
+\(\amalg\) means we apply one such term to another, while sharing their lambdas, e.g:
+
+\[
+3 \models X \amalg 2 \models Y =
+\lambda \lambda \lambda X 2 1 0 (Y 1 0)
+\]
+
+How to write with combinators?
+|]
+
+kiselyovAmalg2 = [r|
+
+Use B R S:
+
+\[
+\begin{align}
+  0 \models d_1 \amalg 0 \models d_2 &=& d_1 d_2 \\
+  n_1 + 1 \models d_1 \amalg 0 \models d_2 &=& 0 \models R d_2 \amalg n_1 \models d_1 \\
+  0 \models d_1 \amalg n_2 + 1 \models d_2 &=& 0 \models B d_1 \amalg n_2 \models d_2 \\
+  n_1 + 1 \models d_1 \amalg n_2 + 1 \models d_2 &=& n_1 \models (0 \models S \amalg n_1 \models d_1) \amalg n_2 \models d_2
+\end{align}
+\]
+
+Solution to example:
+
+\[
+3 \models X \amalg 2 \models Y = RY(BS(B(BS)X))
+\]
+
+|]
+
+kiselyovMain = [r|
+= Kiselyov bracket abstraction =
+
+Write De Bruijn index as Peano number. Turns out this works:
+
+\[
+\newcommand{\ceil}[1]{\lceil #1 \rceil}
+\begin{array}{c c l}
+\ceil{z} &=& 1 \models I \\
+\ceil{s e} &=& n + 1 \models (0 \models K \amalg n \models d) \\
+\ceil{\lambda e} &=&
+  \left\{
+    \begin{array}{ c l }
+      0 \models K d & \quad \textrm{if } n = 0 \\
+      n - 1 \models d & \quad \textrm{otherwise}
+    \end{array}
+  \right. \\
+\ceil{e_1 e_2} &=& \max(n_1, n_2) \models (n_1 \models d_1 \amalg n_2 \models d_2)
+\end{array}
+
+\begin{align}
+n \models d = \ceil{e} \\
+n_1 \models d_1 = \ceil{e_1} \\
+n_2 \models d_2 = \ceil{e_2}
+\end{align}
+\]
+
+Summary: De Bruijn and clever recursion turns lambdas into combinators.
+
+Other algorithms analyze variable names.
+|]
+------------------------------------------------------------------------
+
+== Let it slide ==
+
+[.hs]
+------------------------------------------------------------------------
+data Slide = Slide
+  { desc :: String
+  , exits :: [(String, Slide)]
+  }
+
+mustSlide s = Slide (bloat dom "") [] where Right dom = parse (space *> tops) s
+
+mustLookup x y = maybe undefined id $ lookup x y
+
+mkSlides dir xs = foldr (\(Slide d e) next -> Slide d $ (dir, next):e) (last xs) $ init xs
+
+main = do
+  presoRef <- newIORef $ mkSlides "R" $ mustSlide <$>
+    [ cover
+    , boolMagic
+    , sheffer
+    , sharing
+    , predMagic
+    , predSecret
+    , varless
+    , varlessSecret1
+    , varlessSecret2
+    , skk
+    , skAlgorithm
+    , eliminateU
+    , lastCombinator
+    , justTrees
+    , combsummary
+    , bricks
+    , timeline1
+    , timeline2
+    , scanfinkel
+    , fastforward
+    , combobreak
+    , twoMinutes
+    , intocomb
+    , intolamb
+    , scottencoding
+    , scottencoding2
+    , scottencoding3
+    , mutrec1
+    , mutrec2
+    , recursion1
+    , recursion2
+    , recursion3
+    , fixedpoint
+    , theta
+    , ycompile
+    , factorialExample
+    , factorialExample2
+    , bootstrap
+    , widgetReveal
+    , compilerReveal
+    , slideReveal
+    , copypasta
+    , selfHost1
+    , selfHost2
+    , selfHost3
+    , selfHost4
+    , selfHost5
+    , selfHostOut
+    , deBruijnMagic
+    , deBruijnMagic2
+    , kiselyovAmalg
+    , kiselyovAmalg2
+    , kiselyovMain
+    , haskellForMe
+    , bootstrapGame
+    , bootTips
+    , ioccc
+    ]
+  let
+    addExit dir y (Slide d es) = Slide d $ (dir, y):es
+    dispatch "look" _ = putStr . desc =<< readIORef presoRef
+    dispatch "left"  _ = nav "R" "L"
+    dispatch "right" _ = nav "L" "R"
+    nav from to = do
+      x@(Slide _ es) <- readIORef presoRef
+      case lookup to es of
+        Just y -> writeIORef presoRef $ addExit from x y
+        _ -> pure ()
+  setGlobal do
+    f:as <- words <$> getContents
+    dispatch f as
+  pure ()
+
+io = global >>= id
+------------------------------------------------------------------------
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+<script>
+"use strict";
+const env = {};
+function run(f, args, s) {
+  env.args = args.map(teen);
+  env.buf = [];
+  env.out = [];
+  env.inp = teen(s);
+  env.cursor = 0;
+  env.eval_in = [], env.eval_out = [];
+  env.instance.exports[f]();
+  return { buf : env.buf, out : env.out };
+}
+function run1(s) { return tedea(run("eval_expr", ["Main", "io"], s).out); }
+function teen(s) { return (new TextEncoder()).encode(s); }
+function tede(s) { return (new TextDecoder()).decode(s); }
+function tedea(a) { return (new TextDecoder()).decode(Uint8Array.from(a)); }
+async function load() {
+  try {
+    env.instance = (await WebAssembly.instantiateStreaming(fetch('doh.wasm'), {env:
+      { putchar: c  => env.out.push(c)
+      , eof    : () => env.cursor == env.inp.length
+      , getchar: () => env.inp[env.cursor++]
+      , nextout: () => { env.buf.push(env.out); env.out = []; }
+      , argc   : () => env.args.length
+      , argvlen: i => env.args[i].length
+      , argvat : (i, j) => env.args[i][j]
+
+      , eval_put : c  => env.eval_in.push(c)
+      , eval_run : () => {
+          env.eval_out = teen(eval(tedea(env.eval_in)));
+          env.eval_in = [];
+        }
+      , eval_size: () => env.eval_out.length
+      , eval_at:   i  => env.eval_out[i]
+      }})).instance;
+    run("chat_new", ["Main"], "");
+    const frags = document.getElementsByClassName("hs");
+    for (const it of frags) {
+      const r = run("chat", ["Main"], it.innerText + "\n");
+  const status = tedea(r.buf[0]);
+  console.log("status", status);
+  if (status == "error") {
+  console.log(tedea(r.out));
+  console.log(it.innerText);
+}
+    }
+    run("eval_expr", ["Main", "main"], "");
+    start();
+  } catch(err) {
+    console.log(err);
+  }
+}
+load();
+let preso;
+function setup_page() {
+  document.body.innerHTML = "";
+  preso = document.createElement("div");
+  document.body.appendChild(preso);
+  preso.style = `margin-left:0.5em; margin-right:0.5em; font-size: xxx-large`;
+  look();
+}
+function look() {
+  preso.innerHTML = run1("look");
+  const xs = preso.getElementsByClassName("widget");
+  Array.from(xs).forEach((it) => eval(it.innerText));
+}
+
+function default_unescape() { console.log("not yet!"); };
+let unescape = default_unescape;
+
+function start() {
+  var styleSheet = document.createElement("style");
+  styleSheet.innerText = `.center{text-align:center;}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;
+background-color:#dfdfdf;
+border: 1px dotted #aaaaaa;
+padding-top:0.5em;
+padding-bottom:0.5em;
+margin:0;
+}
+p{margin-top:0.5em;margin-bottom:0.5em;}
+ul{margin-left:2em;}
+.pause{visibility:hidden;}
+.pause1{visibility:hidden;}
+button,input,select,textarea{font-family:inherit;font-size:100%;margin:0}
+h2{margin:0; border-bottom: 0.1ex solid #aaa;}
+body{font-family:"Open Sans",sans-serif;}
+.img95 img{height:95vh;width:auto;}
+.widget{display:none;}
+textarea{font-family:"Inconsolata",monospace;}
+`;
+  document.head.appendChild(styleSheet);
+
+  const orig = document.body.innerHTML;
+  setup_page();
+
+  function slidekey(event) {
+    switch(event.target.nodeName) {
+      case "INPUT":
+      case "TEXTAREA":
+      case "BUTTON":
+        return;
+    }
+    switch (event.key) {
+      case "ArrowLeft":
+        run1("left");
+        look();
+        MathJax.typeset();
+        break;
+      case "ArrowRight":
+      case " ":
+        const xs = preso.getElementsByClassName("pause");
+        if (xs.length == 0) {
+          run1("right");
+          look();
+          MathJax.typeset();
+        } else {
+          Array.from(xs).forEach((it) => {
+            it.style.visibility = "visible";
+            it.classList.remove("pause");
+          });
+          Array.from(preso.getElementsByClassName("pause1")).forEach((it) => {
+            it.classList.remove("pause1");
+            it.classList.add("pause");
+          });
+        }
+        break;
+      case "Escape":
+        const where_were_we = document.body.innerHTML;
+        document.body.innerHTML = orig;
+        document.body.removeEventListener("keydown", slidekey);
+        unescape = function() {
+          setup_page();
+          MathJax.typeset();
+          document.body.addEventListener("keydown", slidekey);
+          unescape = default_unescape;
+        }
+        break;
+    }
+  }
+  document.body.addEventListener("keydown", slidekey);
+}
+</script>
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
