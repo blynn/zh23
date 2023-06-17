@@ -1,17 +1,11 @@
 = ZuriHac 2023 =
 
-This is a fork of https://github.com/blynn/compiler that I presented at
-ZuriHac 2023.
-
-I added the slides and the combinator interpreter visualization thing.
-
-To build them, install `clang` and `lld`, then:
+This is a fork of https://github.com/blynn/compiler that I presented at ZuriHac
+2023. I added the slides and the combinator interpreter visualization. To
+build, install `clang` and `lld`, then:
 
   $ make doh.wasm
   $ ./stitch slide sly.txt
   $ ./stitch slide bubble.txt
 
-When I gave my talk, I served the directory locally using my tool
-https://github.com/blynn/toservemanpages
-and pointed my browser to http://localhost:3000/sly.html and
-http://localhost:3000/bubble.html.
+See https://crypto.stanford.edu/~blynn/zh23/
